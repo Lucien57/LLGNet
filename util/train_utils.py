@@ -6,6 +6,41 @@ util/train_utils.py
 import torch, torch.nn as nn, numpy as np
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, cohen_kappa_score
 from torch.optim import Adam, AdamW
+from torch.utils.data import ConcatDataset, DataLoader
+
+def _unpack_loader_batch(batch):
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Unexpected batch type: {type(batch)}")
+    if len(batch) == 3:
+        xb, yb, sb = batch
+        sess = None
+    elif len(batch) == 4:
+        xb, yb, sb, sess = batch
+    else:
+        raise ValueError(f"Unexpected batch length: {len(batch)}")
+    return xb, yb, sb, sess
+
+def _merge_train_val_loaders(train_loader, val_loader):
+    if train_loader is None or val_loader is None:
+        return train_loader
+    merged_ds = ConcatDataset([train_loader.dataset, val_loader.dataset])
+    batch_size = getattr(train_loader, "batch_size", 1)
+    num_workers = getattr(train_loader, "num_workers", 0)
+    drop_last = getattr(train_loader, "drop_last", False)
+    pin_memory = getattr(train_loader, "pin_memory", False)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": num_workers,
+        "drop_last": drop_last,
+        "pin_memory": pin_memory,
+    }
+    if getattr(train_loader, "persistent_workers", False) and num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+    collate_fn = getattr(train_loader, "collate_fn", None)
+    if collate_fn is not None:
+        loader_kwargs["collate_fn"] = collate_fn
+    return DataLoader(merged_ds, **loader_kwargs)
 
 def build_model(model_name, n_classes, chans, samples, dataset_name, cfg):
     model_key = cfg.get("model", model_name)
@@ -54,8 +89,11 @@ def build_model(model_name, n_classes, chans, samples, dataset_name, cfg):
         return Conformer(**params)
 
     elif model_key == "EEGNet":
-        from models.EEGNet import EEGNet
+        from models.EEGNet import EEGNet, AdversarialEEGNet
         args = dict(base_args)
+        use_adv = bool(_pop(args, "enable_adversarial_head", "use_adversarial_head", default=False))
+        adv_lambda = _pop(args, "adv_lambda", default=0.01)
+        n_nuisance = _pop(args, "n_nuisance", "n_nuis", default=None)
         params = {"n_classes": n_classes, "Chans": chans, "Samples": samples}
         _assign(args, params, "kernLength")
         _assign(args, params, "F1")
@@ -63,7 +101,16 @@ def build_model(model_name, n_classes, chans, samples, dataset_name, cfg):
         _assign(args, params, "F2")
         _assign(args, params, "dropoutRate")
         _assign(args, params, "norm_rate")
-        return EEGNet(**params)
+        if not use_adv:
+            return EEGNet(**params)
+        adv_kwargs = dict(params)
+        adv_kwargs.pop("n_classes", None)
+        return AdversarialEEGNet(
+            n_classes=params["n_classes"],
+            n_nuisance=n_nuisance or chans,
+            lambd=adv_lambda,
+            **adv_kwargs,
+        )
         
     elif model_key == "DeepConvNet":
         from models.DeepConvNet import DeepConvNet
@@ -95,6 +142,7 @@ def train_without_val(model, device, train_loader, test_loader, cfg, log, split_
     else:
         pass
     crit = nn.CrossEntropyLoss()
+    adv_lambd = cfg["train"].get("adv_lambda", 0.0)##adv
     max_ep = cfg["train"]["max_epochs"]
     best_acc = -1.0
     best_loss = float("inf")
@@ -103,43 +151,74 @@ def train_without_val(model, device, train_loader, test_loader, cfg, log, split_
     for ep in range(1, max_ep + 1):
         model.train()
         losses, correct, total = [], 0, 0
-        for xb, yb, _ in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
+        adv_correct, adv_total = 0, 0
+        for batch in train_loader:
+            xb, yb, sb, _ = _unpack_loader_batch(batch)
+            xb, yb, sb = xb.to(device), yb.to(device), sb.to(device)
             opt.zero_grad()
             logits = model(xb)
-            loss = crit(logits, yb)
+            if isinstance(logits, tuple):
+                cla_logits, adv_logits = logits
+            else:
+                cla_logits, adv_logits = logits, None
+
+            loss = crit(cla_logits, yb)
+            if adv_logits is not None and adv_lambd > 0:
+                loss = loss + adv_lambd * crit(adv_logits, sb)
             loss.backward()
             opt.step()
 
             losses.append(loss.item())
-            preds = torch.argmax(logits, 1)
+            preds = torch.argmax(cla_logits, 1)
             correct += (preds == yb).sum().item()
             total += yb.size(0)
+            if adv_logits is not None:
+                adv_preds = torch.argmax(adv_logits, 1)
+                adv_correct += (adv_preds == sb).sum().item()
+                adv_total += sb.size(0)
 
         tr_loss = float(np.mean(losses)) if losses else 0.0
         tr_acc = (correct / total) if total else 0.0
+        tr_adv_acc = (adv_correct / adv_total) if adv_total else None
         if tr_acc > best_acc or (tr_acc == best_acc and tr_loss < best_loss):
             best_acc = tr_acc
             best_loss = tr_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-        te_loss, te_acc = float("nan"), float("nan")
+        te_loss, te_acc, te_adv_acc = float("nan"), float("nan"), None
         if test_loader is not None:
             model.eval()
             te_losses, te_correct, te_total = [], 0, 0
+            adv_correct, adv_total = 0, 0
             with torch.no_grad():
-                for xb, yb, _ in test_loader:
-                    xb, yb = xb.to(device), yb.to(device)
+                for batch in test_loader:
+                    xb, yb, sb, _ = _unpack_loader_batch(batch)
+                    xb, yb, sb = xb.to(device), yb.to(device), sb.to(device)
                     logits = model(xb)
-                    loss = crit(logits, yb)
+                    if isinstance(logits, tuple):
+                        cla_logits, adv_logits = logits
+                    else:
+                        cla_logits, adv_logits = logits, None
+                    loss = crit(cla_logits, yb)
                     te_losses.append(loss.item())
-                    preds = torch.argmax(logits, 1)
+                    preds = torch.argmax(cla_logits, 1)
                     te_correct += (preds == yb).sum().item()
                     te_total += yb.size(0)
+                    if adv_logits is not None:
+                        adv_preds = torch.argmax(adv_logits, 1)
+                        adv_correct += (adv_preds == sb).sum().item()
+                        adv_total += sb.size(0)
             te_loss = float(np.mean(te_losses)) if te_losses else 0.0
             te_acc = (te_correct / te_total) if te_total else 0.0
+            te_adv_acc = (adv_correct / adv_total) if adv_total else None
 
-        log(f"[Epoch {ep:03d}] train_loss={tr_loss:.4f} acc={tr_acc:.4f} || test_loss={te_loss:.4f} acc={te_acc:.4f}")
+        msg = f"[Epoch {ep:03d}] train_loss={tr_loss:.4f} cla_acc={tr_acc:.4f}"
+        if tr_adv_acc is not None:
+            msg += f" adv_acc={tr_adv_acc:.4f}"
+        msg += f" || test_loss={te_loss:.4f} cla_acc={te_acc:.4f}"
+        if te_adv_acc is not None:
+            msg += f" adv_acc={te_adv_acc:.4f}"
+        log(msg)
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -147,80 +226,139 @@ def train_without_val(model, device, train_loader, test_loader, cfg, log, split_
 
 def train_one_split(model, device, loaders, cfg, log, split_name=None):
     betas = cfg["train"].get("betas", (0.9, 0.999))
-    
+    adv_lambd = cfg["train"].get("adv_lambda", 0.0)
     opt_name = cfg["train"].get("optimizer", "Adam")
-    if opt_name == "Adam":     
-        opt = Adam(model.parameters(), lr=cfg["train"]["learning_rate"],
-               weight_decay=cfg["train"].get("weight_decay", 0.0), betas=betas)
-    elif opt_name == "AdamW":
-        opt = AdamW(model.parameters(), lr=cfg["train"]["learning_rate"],
-               weight_decay=cfg["train"].get("weight_decay", 0.0), betas=betas)
-    else:
-        pass
-    
+
+    def _make_optimizer():
+        if opt_name == "Adam":
+            return Adam(model.parameters(), lr=cfg["train"]["learning_rate"],
+                        weight_decay=cfg["train"].get("weight_decay", 0.0), betas=betas)
+        if opt_name == "AdamW":
+            return AdamW(model.parameters(), lr=cfg["train"]["learning_rate"],
+                         weight_decay=cfg["train"].get("weight_decay", 0.0), betas=betas)
+        raise ValueError(f"Unsupported optimizer: {opt_name}")
+
+    opt = _make_optimizer()
     crit = nn.CrossEntropyLoss()
-    
-    max_ep = cfg["train"]["max_epochs"]
-    early_stop_ep = max_ep
+
+    stage1_epochs = cfg["train"]["max_epochs"]
+    stage2_epochs = int(cfg["train"].get("two_stage_extra_epochs", 30))
+    two_stage = bool(cfg["train"].get("two_stage", False))
+    early_stop_ep = stage1_epochs
     patience = cfg["train"]["early_stopping_patience"]
+    train_loader = loaders["train_loader"]
     val_loader = loaders.get("val_loader")
     has_val = val_loader is not None
     best_state, best_metric, best_loss, no_imp = None, -1.0, float("inf"), 0
-    best_test = 0
+    best_test = 0.0
     test_loader = loaders.get("test_loader")
-    # model_cls_name = model.module.__class__.__name__ if hasattr(model, "module") else model.__class__.__name__
-    # log_all_epochs = model_cls_name.lower() == "conformer" # Debug for EEGConformer
-    for ep in range(1, max_ep + 1):
-        # should_log = (ep % 10 == 0 or ep == 1 or ep == max_ep)
-        model.train(); tr_loss = []; yt = []; yp = []
-        for xb, yb, _ in loaders["train_loader"]:
-            xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad(); logits = model(xb)
-            loss = crit(logits, yb); loss.backward(); opt.step()
+    stage2_ran = False
+
+    for ep in range(1, stage1_epochs + 1):
+        model.train()
+        tr_loss = []
+        yt, yp = [], []
+        adv_correct, adv_total = 0, 0
+        for batch in train_loader:
+            xb, yb, sb, _ = _unpack_loader_batch(batch)
+            xb, yb, sb = xb.to(device), yb.to(device), sb.to(device)
+            opt.zero_grad()
+            logits = model(xb)
+            if isinstance(logits, tuple):
+                cla_logits, adv_logits = logits
+            else:
+                cla_logits, adv_logits = logits, None
+
+            loss = crit(cla_logits, yb)
+            if adv_logits is not None and adv_lambd > 0:
+                loss = loss + adv_lambd * crit(adv_logits, sb)
+            loss.backward()
+            opt.step()
+
             tr_loss.append(loss.item())
-            yt.extend(yb.cpu().numpy()); yp.extend(torch.argmax(logits, 1).cpu().numpy())
-        tr_acc = accuracy_score(yt, yp); tr_loss = float(np.mean(tr_loss))
+            yt.extend(yb.cpu().numpy())
+            yp.extend(torch.argmax(cla_logits, 1).cpu().numpy())
+            if adv_logits is not None:
+                adv_preds = torch.argmax(adv_logits, 1)
+                adv_correct += (adv_preds == sb).sum().item()
+                adv_total += sb.size(0)
+        tr_acc = accuracy_score(yt, yp) if yt else 0.0
+        tr_loss = float(np.mean(tr_loss)) if tr_loss else 0.0
+        tr_adv_acc = (adv_correct / adv_total) if adv_total else None
 
         if has_val:
-            vl_loss = []; yv = []; pv = []
+            vl_loss_vals = []
+            yv, pv = [], []
+            adv_val_correct, adv_val_total = 0, 0
             model.eval()
             with torch.no_grad():
-                for xb, yb, _ in val_loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    logits = model(xb); loss = crit(logits, yb)
-                    vl_loss.append(loss.item())
-                    yv.extend(yb.cpu().numpy()); pv.extend(torch.argmax(logits, 1).cpu().numpy())
-            vl_acc = accuracy_score(yv, pv)
-            vl_loss = float(np.mean(vl_loss))
+                for batch in val_loader:
+                    xb, yb, sb, _ = _unpack_loader_batch(batch)
+                    xb, yb, sb = xb.to(device), yb.to(device), sb.to(device)
+                    logits = model(xb)
+                    if isinstance(logits, tuple):
+                        cla_logits, adv_logits = logits
+                    else:
+                        cla_logits, adv_logits = logits, None
+                    loss = crit(cla_logits, yb)
+                    if adv_logits is not None and adv_lambd > 0:
+                        loss = loss + adv_lambd * crit(adv_logits, sb)
+                    vl_loss_vals.append(loss.item())
+                    yv.extend(yb.cpu().numpy())
+                    pv.extend(torch.argmax(cla_logits, 1).cpu().numpy())
+                    if adv_logits is not None:
+                        adv_preds = torch.argmax(adv_logits, 1)
+                        adv_val_correct += (adv_preds == sb).sum().item()
+                        adv_val_total += sb.size(0)
+            vl_acc = accuracy_score(yv, pv) if yv else 0.0
+            vl_loss = float(np.mean(vl_loss_vals)) if vl_loss_vals else 0.0
+            vl_adv_acc = (adv_val_correct / adv_val_total) if adv_val_total else None
         else:
             vl_acc = None
             vl_loss = None
+            vl_adv_acc = None
 
         test_acc = None
-        # if test_loader is not None and should_log:
-        te_true, te_pred = [], []
-        with torch.no_grad():
-            for xb, yb, _ in test_loader:
-                xb = xb.to(device)
-                logits = model(xb)
-                te_true.extend(yb.cpu().numpy())
-                te_pred.extend(torch.argmax(logits, 1).cpu().numpy())
-        test_acc = accuracy_score(te_true, te_pred) if te_true else 0.0
-        
-        # if split_name and (log_all_epochs or ep <= 10):
-            # log_epoch_predictions(log, split_name, ep, te_true, te_pred)
+        test_adv_acc = None
+        if test_loader is not None:
+            te_true, te_pred = [], []
+            adv_test_correct, adv_test_total = 0, 0
+            with torch.no_grad():
+                for batch in test_loader:
+                    xb, yb, sb, _ = _unpack_loader_batch(batch)
+                    xb, sb = xb.to(device), sb.to(device)
+                    logits = model(xb)
+                    if isinstance(logits, tuple):
+                        cla_logits, adv_logits = logits
+                    else:
+                        cla_logits, adv_logits = logits, None
+                    te_true.extend(yb.cpu().numpy())
+                    te_pred.extend(torch.argmax(cla_logits, 1).cpu().numpy())
+                    if adv_logits is not None:
+                        adv_preds = torch.argmax(adv_logits, 1)
+                        adv_test_correct += (adv_preds == sb).sum().item()
+                        adv_test_total += sb.size(0)
+            test_acc = accuracy_score(te_true, te_pred) if te_true else 0.0
+            test_adv_acc = (adv_test_correct / adv_test_total) if adv_test_total else None
 
-        # if should_log:
-        msg = f"[Epoch {ep:03d}] train_loss={tr_loss:.4f} acc={tr_acc:.4f}"
+        prefix = f"[Epoch {ep:03d}]"
+        msg = f"{prefix} train_loss={tr_loss:.4f} cla_acc={tr_acc:.4f}"
+        if tr_adv_acc is not None:
+            msg += f" adv_acc={tr_adv_acc:.4f}"
         if has_val:
-            msg += f" || val_loss={vl_loss:.4f} acc={vl_acc:.4f}"
+            msg += f" || val_loss={vl_loss:.4f} cla_acc={vl_acc:.4f}"
+            if vl_adv_acc is not None:
+                msg += f" adv_acc={vl_adv_acc:.4f}"
         if test_acc is not None:
-            msg += f" || test_acc={test_acc:.4f} || best_test={best_test:.4f}"
+            msg += f" || test_acc={test_acc:.4f}"
+            if test_adv_acc is not None:
+                msg += f" adv_acc={test_adv_acc:.4f}"
+            msg += f" || best_test={best_test:.4f}"
         log(msg)
-        
-        if test_acc > best_test :
+
+        if test_acc is not None and test_acc > best_test:
             best_test = test_acc
-        
+
         metric = vl_acc if has_val else tr_acc
         loss_for_metric = vl_loss if has_val else tr_loss
         if metric is not None and (metric > best_metric or (metric == best_metric and loss_for_metric < best_loss)):
@@ -233,7 +371,91 @@ def train_one_split(model, device, loaders, cfg, log, split_name=None):
             if no_imp >= patience and ep > early_stop_ep:
                 log(f"[EarlyStop] epoch={ep} best_val_acc={best_metric:.4f}")
                 break
-    if best_state is not None:
+
+    if two_stage:
+        if not has_val:
+            log("[TwoStage] Requested but no validation loader is available; skipping stage 2.")
+        elif stage2_epochs <= 0:
+            log("[TwoStage] Extra epoch count <= 0; skipping stage 2.")
+        else:
+            merged_loader = _merge_train_val_loaders(train_loader, val_loader)
+            merged_count = len(merged_loader.dataset) if hasattr(merged_loader, "dataset") else (len(train_loader.dataset) + len(val_loader.dataset))
+            log(f"[TwoStage] Stage 1 complete (best_val_acc={best_metric:.4f}). "
+                f"Merging train({len(train_loader.dataset)}) + val({len(val_loader.dataset)}) -> "
+                f"{merged_count} samples and running {stage2_epochs} more epochs.")
+            if best_state is not None:
+                model.load_state_dict(best_state)
+            opt = _make_optimizer()
+            stage2_ran = True
+            for extra_idx in range(1, stage2_epochs + 1):
+                ep = stage1_epochs + extra_idx
+                model.train()
+                tr_loss = []
+                yt, yp = [], []
+                adv_correct, adv_total = 0, 0
+                for batch in merged_loader:
+                    xb, yb, sb, _ = _unpack_loader_batch(batch)
+                    xb, yb, sb = xb.to(device), yb.to(device), sb.to(device)
+                    opt.zero_grad()
+                    logits = model(xb)
+                    if isinstance(logits, tuple):
+                        cla_logits, adv_logits = logits
+                    else:
+                        cla_logits, adv_logits = logits, None
+                    loss = crit(cla_logits, yb)
+                    if adv_logits is not None and adv_lambd > 0:
+                        loss = loss + adv_lambd * crit(adv_logits, sb)
+                    loss.backward()
+                    opt.step()
+                    tr_loss.append(loss.item())
+                    yt.extend(yb.cpu().numpy())
+                    yp.extend(torch.argmax(cla_logits, 1).cpu().numpy())
+                    if adv_logits is not None:
+                        adv_preds = torch.argmax(adv_logits, 1)
+                        adv_correct += (adv_preds == sb).sum().item()
+                        adv_total += sb.size(0)
+                tr_acc = accuracy_score(yt, yp) if yt else 0.0
+                tr_loss_val = float(np.mean(tr_loss)) if tr_loss else 0.0
+                tr_adv_acc = (adv_correct / adv_total) if adv_total else None
+
+                test_acc = None
+                test_adv_acc = None
+                if test_loader is not None:
+                    te_true, te_pred = [], []
+                    adv_test_correct, adv_test_total = 0, 0
+                    with torch.no_grad():
+                        for batch in test_loader:
+                            xb, yb, sb, _ = _unpack_loader_batch(batch)
+                            xb, sb = xb.to(device), sb.to(device)
+                            logits = model(xb)
+                            if isinstance(logits, tuple):
+                                cla_logits, adv_logits = logits
+                            else:
+                                cla_logits, adv_logits = logits, None
+                            te_true.extend(yb.cpu().numpy())
+                            te_pred.extend(torch.argmax(cla_logits, 1).cpu().numpy())
+                            if adv_logits is not None:
+                                adv_preds = torch.argmax(adv_logits, 1)
+                                adv_test_correct += (adv_preds == sb).sum().item()
+                                adv_test_total += sb.size(0)
+                    test_acc = accuracy_score(te_true, te_pred) if te_true else 0.0
+                    test_adv_acc = (adv_test_correct / adv_test_total) if adv_test_total else None
+
+                prefix = f"[Epoch {ep:03d}][S2]"
+                msg = f"{prefix} train_loss={tr_loss_val:.4f} cla_acc={tr_acc:.4f}"
+                if tr_adv_acc is not None:
+                    msg += f" adv_acc={tr_adv_acc:.4f}"
+                if test_acc is not None:
+                    msg += f" || test_acc={test_acc:.4f}"
+                    if test_adv_acc is not None:
+                        msg += f" adv_acc={test_adv_acc:.4f}"
+                    msg += f" || best_test={best_test:.4f}"
+                log(msg)
+
+                if test_acc is not None and test_acc > best_test:
+                    best_test = test_acc
+
+    if not stage2_ran and best_state is not None:
         model.load_state_dict(best_state)
     return best_metric
 
@@ -241,9 +463,15 @@ def evaluate_subjectwise(model, device, loader):
     from collections import defaultdict
     model.eval(); y_true_all = []; y_pred_all = []; subjects_all = []
     with torch.no_grad():
-        for xb, yb, sb in loader:
+        for batch in loader:
+            xb, yb, sb, _ = _unpack_loader_batch(batch)
             xb = xb.to(device)
-            pred = torch.argmax(model(xb), 1).cpu().numpy()
+            logits = model(xb)
+            if isinstance(logits, tuple):
+                cla_logits, _ = logits
+            else:
+                cla_logits = logits
+            pred = torch.argmax(cla_logits, 1).cpu().numpy()
             y_true_all.extend(yb.numpy()); y_pred_all.extend(pred); subjects_all.extend(sb.numpy())
 
     labels = list(range(loader.dataset.n_classes))
@@ -278,3 +506,4 @@ def evaluate_subjectwise(model, device, loader):
         "labels": labels,
     }
     return per_subject, overall
+
