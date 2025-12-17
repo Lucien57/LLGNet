@@ -149,3 +149,27 @@ class EEGNet_feature(nn.Module):
         output = output.reshape(output.size(0), -1)
         return output
 
+##adv
+class GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+class AdversarialEEGNet(nn.Module):
+    def __init__(self, n_classes, n_nuisance, lambd, **eeg_kwargs):
+        super().__init__()
+        self.feat = EEGNet_feature(n_classes, **eeg_kwargs)
+        feat_dim = eeg_kwargs["F2"] * (eeg_kwargs["Samples"] // (4 * 8))
+        self.cla_head = nn.Linear(feat_dim, n_classes)
+        self.adv_head = nn.Linear(feat_dim, n_nuisance)
+        self.lambd = lambd
+
+    def forward(self, x):
+        f = self.feat(x)
+        cla = self.cla_head(f)
+        adv = self.adv_head(GradReverse.apply(f, self.lambd))
+        return cla, adv
