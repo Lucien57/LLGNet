@@ -37,6 +37,15 @@ def main():
     for split in splits:
         chans, samples = split["chans_samples"]
         n_classes = split["n_classes"]
+        # Auto-infer adversarial head nuisance classes when requested
+        model_args = cfg.setdefault("model_args", {})
+        if model_args.get("enable_adversarial_head"):
+            subjects = split["train_loader"].dataset.subjects
+            model_args.setdefault(
+                "n_nuisance",
+                int(subjects.max() + 1)  # 用最大 subject id + 1
+            )
+            
         model = build_model(env["model_name"], n_classes, chans, samples, env["dataset"], cfg).to(device)
         log("[RESET] model reinitialized for new fold")
 
@@ -84,3 +93,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
