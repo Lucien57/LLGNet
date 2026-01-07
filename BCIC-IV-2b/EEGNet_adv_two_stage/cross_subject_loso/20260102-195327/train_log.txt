@@ -1,0 +1,40 @@
+[CONFIG] hyperparameters
+[CONFIG] model:
+[CONFIG]   "AdversarialEEGNet"
+[CONFIG] model_args:
+[CONFIG]   {
+[CONFIG]     "D": 2,
+[CONFIG]     "F1": 8,
+[CONFIG]     "F2": 16,
+[CONFIG]     "adv_lambda": 0.01,
+[CONFIG]     "dropoutRate": 0.25,
+[CONFIG]     "enable_adversarial_head": true,
+[CONFIG]     "kernLength": 64,
+[CONFIG]     "norm_rate": 0.25
+[CONFIG]   }
+[CONFIG] train:
+[CONFIG]   {
+[CONFIG]     "adv_lambda": 0.01,
+[CONFIG]     "batch_size": 32,
+[CONFIG]     "early_stopping_patience": 20,
+[CONFIG]     "learning_rate": 0.001,
+[CONFIG]     "max_epochs": 100,
+[CONFIG]     "num_workers": 4,
+[CONFIG]     "random_seed": 57,
+[CONFIG]     "two_stage": true,
+[CONFIG]     "two_stage_extra_epochs": 30,
+[CONFIG]     "weight_decay": 0.0
+[CONFIG]   }
+[CONFIG] data:
+[CONFIG]   {
+[CONFIG]     "Norm": "EA",
+[CONFIG]     "augmentation": {
+[CONFIG]       "R": true,
+[CONFIG]       "S": true
+[CONFIG]     },
+[CONFIG]     "use_augmentation": false
+[CONFIG]   }
+[CONFIG] paths.lmdb_path.BCIC-IV-2b=lmdb/BCIC-IV-2b
+[SETUP] dataset=BCIC-IV-2b | method=cross_subject_loso | model=EEGNet_adv_two_stage
+[DATA ] subjects=9 | total_samples=6520 | shape=(C,T)=(3,1000) | n_classes=2
+[DATA ] preprocess bandpass=[1, 40]Hz | resample=200Hz | window=0s→4s

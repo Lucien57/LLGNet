@@ -1,0 +1,173 @@
+{
+  "dataset": "BCIC-IV-2b",
+  "model": "DeepConvNet_two_stage",
+  "test_method": "cross_subject_loso",
+  "n_classes": 2,
+  "per_subject_accuracy": {
+    "1": 0.7097222222222223,
+    "2": 0.6691176470588235,
+    "3": 0.6097222222222223,
+    "4": 0.8418918918918918,
+    "5": 0.8067567567567567,
+    "6": 0.75,
+    "7": 0.7763888888888889,
+    "8": 0.8263157894736842,
+    "9": 0.7055555555555556
+  },
+  "per_subject_metrics": null,
+  "folds": [
+    {
+      "split": "testS_1_valMix",
+      "val_acc": 0.7991379310344827,
+      "test_acc": 0.7097222222222223,
+      "val_subjects": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "test_f1_macro": 0.7093718313939452,
+      "test_cohen_kappa": 0.4194444444444444
+    },
+    {
+      "split": "testS_2_valMix",
+      "val_acc": 0.800513698630137,
+      "test_acc": 0.6691176470588235,
+      "val_subjects": [
+        1,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "test_f1_macro": 0.6688017767810563,
+      "test_cohen_kappa": 0.3382352941176471
+    },
+    {
+      "split": "testS_3_valMix",
+      "val_acc": 0.8198275862068966,
+      "test_acc": 0.6097222222222223,
+      "val_subjects": [
+        1,
+        2,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "test_f1_macro": 0.6070838326027976,
+      "test_cohen_kappa": 0.21944444444444444
+    },
+    {
+      "split": "testS_4_valMix",
+      "val_acc": 0.7889273356401384,
+      "test_acc": 0.8418918918918918,
+      "val_subjects": [
+        1,
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "test_f1_macro": 0.8400691592824725,
+      "test_cohen_kappa": 0.6837837837837838
+    },
+    {
+      "split": "testS_5_valMix",
+      "val_acc": 0.7958477508650519,
+      "test_acc": 0.8067567567567567,
+      "val_subjects": [
+        1,
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        9
+      ],
+      "test_f1_macro": 0.8066292789804821,
+      "test_cohen_kappa": 0.6135135135135135
+    },
+    {
+      "split": "testS_6_valMix",
+      "val_acc": 0.7965517241379311,
+      "test_acc": 0.75,
+      "val_subjects": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9
+      ],
+      "test_f1_macro": 0.745475113122172,
+      "test_cohen_kappa": 0.5
+    },
+    {
+      "split": "testS_7_valMix",
+      "val_acc": 0.7801724137931034,
+      "test_acc": 0.7763888888888889,
+      "val_subjects": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        9
+      ],
+      "test_f1_macro": 0.7759181614154735,
+      "test_cohen_kappa": 0.5527777777777778
+    },
+    {
+      "split": "testS_8_valMix",
+      "val_acc": 0.8220486111111112,
+      "test_acc": 0.8263157894736842,
+      "val_subjects": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9
+      ],
+      "test_f1_macro": 0.8262965425531915,
+      "test_cohen_kappa": 0.6526315789473685
+    },
+    {
+      "split": "testS_9_valMix",
+      "val_acc": 0.8060344827586207,
+      "test_acc": 0.7055555555555556,
+      "val_subjects": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "test_f1_macro": 0.7027458617332035,
+      "test_cohen_kappa": 0.4111111111111111
+    }
+  ]
+}

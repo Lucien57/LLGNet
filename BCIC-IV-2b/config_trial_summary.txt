@@ -1,0 +1,6 @@
+Config               | LOSO                         
+---------------------+------------------------------
+ShallowConvNet_plain | seed=default: 0.7545 ± 0.0874
+wo_stage             | seed=default: 0.7594 ± 0.0863
+ShallowConvNet_adv   | seed=default: 0.7502 ± 0.0809
+wo_stage             | seed=default: 0.7506 ± 0.0853
