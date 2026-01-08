@@ -101,9 +101,11 @@ def build_model(model_name, n_classes, chans, samples, dataset_name, cfg):
         )
 
     elif model_key == "EEGNet":
-        from models.EEGNet import EEGNet, AdversarialEEGNet
+        from models.EEGNet import EEGNet, AdversarialEEGNet, ConditionalAdversarialEEGNet
         args = dict(base_args)
         use_adv = bool(_pop(args, "enable_adversarial_head", "use_adversarial_head", default=False))
+        # conditional adversarial flag (new): enable_conditional_adversarial_head
+        use_cond_adv = bool(_pop(args, "enable_conditional_adversarial_head", default=False))
         adv_lambda = _pop(args, "adv_lambda", default=0.01)
         n_nuisance = _pop(args, "n_nuisance", "n_nuis", default=None)
         params = {"n_classes": n_classes, "Chans": chans, "Samples": samples}
@@ -113,6 +115,16 @@ def build_model(model_name, n_classes, chans, samples, dataset_name, cfg):
         _assign(args, params, "F2")
         _assign(args, params, "dropoutRate")
         _assign(args, params, "norm_rate")
+        # priority: conditional adv if requested, otherwise standard adv if requested
+        if use_cond_adv:
+            adv_kwargs = dict(params)
+            adv_kwargs.pop("n_classes", None)
+            return ConditionalAdversarialEEGNet(
+                n_classes=params["n_classes"],
+                n_nuisance=n_nuisance or chans,
+                lambd=adv_lambda,
+                **adv_kwargs,
+            )
         if not use_adv:
             return EEGNet(**params)
         adv_kwargs = dict(params)

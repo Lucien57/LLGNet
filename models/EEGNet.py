@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class EEGNet(nn.Module):
 
@@ -173,3 +174,44 @@ class AdversarialEEGNet(nn.Module):
         cla = self.cla_head(f)
         adv = self.adv_head(GradReverse.apply(f, self.lambd))
         return cla, adv
+
+
+class ConditionalAdversarialEEGNet(nn.Module):
+    """
+    Conditional Domain Adversarial Network (C-DAN) variant for EEGNet.
+    - Conditions domain classifier on class posterior p(y|x) (softmax of cla logits).
+    - Uses outer-product conditioning: f (B, feat_dim) x p (B, n_classes) -> (B, feat_dim * n_classes)
+    - Applies Gradient Reversal on the conditioned feature before domain classification.
+    Note: If feat_dim * n_classes becomes too large, consider adding a projection or
+    multi-head variant to reduce parameter counts.
+    """
+    def __init__(self, n_classes, n_nuisance, lambd, **eeg_kwargs):
+        super().__init__()
+        self.feat = EEGNet_feature(n_classes, **eeg_kwargs)
+        feat_dim = eeg_kwargs["F2"] * (eeg_kwargs["Samples"] // (4 * 8))
+        self.cla_head = nn.Linear(feat_dim, n_classes)
+        # domain classifier operates on conditioned flattened feature
+        self.domain_clf = nn.Sequential(
+            nn.Linear(feat_dim * n_classes, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, n_nuisance),
+        )
+        self.lambd = lambd
+        self.n_classes = n_classes
+        self.feat_dim = feat_dim
+
+    def forward(self, x):
+        # extract feature and class logits
+        f = self.feat(x)                     # (B, feat_dim)
+        cla_logits = self.cla_head(f)        # (B, n_classes)
+        # soft conditioning
+        p = F.softmax(cla_logits, dim=1)     # (B, n_classes)
+        # outer-product conditioning -> (B, feat_dim, n_classes)
+        f_cond = f.unsqueeze(2) * p.unsqueeze(1)
+        # flatten to (B, feat_dim * n_classes)
+        f_cond_flat = f_cond.reshape(f_cond.size(0), -1)
+        # apply gradient reversal and domain classifier
+        f_grl = GradReverse.apply(f_cond_flat, self.lambd)
+        domain_logits = self.domain_clf(f_grl)
+        return cla_logits, domain_logits
